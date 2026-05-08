@@ -1,0 +1,910 @@
+#!/bin/python
+
+import requests
+import hashlib
+import random
+import string
+import socket
+import subprocess
+import time
+import json
+import os
+import select
+import threading
+
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+
+URL  = "http://navidrome-server"
+USER = "user"
+PASS = "passwd"
+HOST = "127.0.0.1"
+PORT = 6600
+CHECK_DELAY = 10
+
+def dequote(s):
+    s = s.strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        s = s[1:-1]
+    return s
+
+class MPDServer:
+    def __init__(self, mpv):
+        self.mpv = mpv
+        self.mpv.next_callback = self.next_track
+
+        self.nvd = NavidromeClient(URL, USER, PASS)
+
+        self.playlist = []
+        self.playlist_info = []
+        self.index = 0
+        self.playing = False
+        self.paused = False
+
+        self.volume = 100
+        
+        self.idle_event = threading.Event()
+
+        self.lock = threading.Lock()
+
+        self.artist_cache = {}
+        self.album_cache  = {}
+        self.song_cache   = {}
+
+        self.subsystems_history = {}
+        self.block_next = False
+
+        self.track_started_at = None
+        self.scrobbled = False
+
+    def purge_cache(self):
+        self.artist_cache = {}
+        self.album_cache  = {}
+        self.song_cache   = {k: self.song_cache[k] for k in self.playlist_info if k in self.song_cache}
+        self.tag_subsystem("library")
+        self.idle_event.set()
+
+    def tag_subsystem(self, sub):
+        t = int(datetime.now().timestamp())
+        if not t in self.subsystems_history:
+            self.subsystems_history[t] = set()
+        self.subsystems_history[t].add(sub)
+
+    def play(self, index=0):
+        if 0 <= index < len(self.playlist):
+            self.index = index
+            self.play_current()
+        else:
+            self.stop()
+
+    def seek(self, index, timepos):
+        if self.index != index:
+            self.play(index)
+        self.mpv.seek(timepos)
+        self.tag_subsystem("player")
+        self.idle_event.set()
+
+    def play_current(self):
+        if not self.playlist:
+            return
+        if self.index < 0 or self.index >= len(self.playlist):
+            return
+        url = self.playlist[self.index]
+        if self.playing or self.paused:
+            self.block_next = True
+        self.mpv.play_url(url)
+        self.playing = True
+        self.initiate_scrobble()
+        self.tag_subsystem("player")
+        self.idle_event.set()
+
+    def initiate_scrobble(self):
+        self.track_started_at = time.time()
+        current_song_id = self.playlist_info[self.index]
+        self.scrobbled = False
+
+        try:
+            self.nvd.scrobble(
+                current_song_id,
+                submission=False,
+                time_ms=int(self.track_started_at)
+            )
+        except Exception as e:
+            print("Now playing update failed:", e)
+
+    def send_scrobble(self):
+        if self.index >= len(self.playlist):
+            return
+        if self.scrobbled:
+            return
+        if self.playlist_info[self.index] not in self.song_cache:
+            return
+        duration = self.song_cache[self.playlist_info[self.index]].get("Time")
+        if not duration:
+            return
+
+        elapsed = time.time() - self.track_started_at
+        t = self.mpv.get_time()
+
+        should_scrobble_realtime = (
+            elapsed >= 240 or
+            elapsed >= (duration * 0.5)
+        )
+        should_scrobble_playertime = (
+            t >= 240 or
+            t >= (duration * 0.5)
+        )
+
+        if should_scrobble_realtime and should_scrobble_playertime:
+            try:
+                self.nvd.scrobble(
+                    self.playlist_info[self.index],
+                    submission=True,
+                )
+
+                self.scrobbled = True
+                #print("Scrobbled:", self.playlist_info[self.index])
+
+            except Exception as e:
+                print("Scrobble failed:", e)
+
+    def next_track(self):
+        if self.block_next:
+            pass
+        elif self.index + 1 < len(self.playlist):
+            self.send_scrobble()
+            self.index += 1
+            self.play_current()
+        else:
+            self.send_scrobble()
+            self.stop()
+            self.mpv.stop()
+            self.playing = False
+            self.paused = False
+        self.block_next = False
+        self.tag_subsystem("player")
+        self.idle_event.set()
+
+    def stop(self):
+        if self.playing or self.paused:
+            self.block_next = True
+        self.playing = False
+        self.paused = False
+        self.index = 0
+        self.mpv.stop()
+        self.block_next = False
+        self.tag_subsystem("player")
+        self.idle_event.set()
+
+    def prev_track(self):
+        if self.index > 0:
+            self.index -= 1
+        self.play_current()
+        self.tag_subsystem("player")
+        self.idle_event.set()
+
+    def pause(self):
+        if self.playing:
+            self.mpv.pause()
+            self.playing = False
+            self.paused = True
+        self.tag_subsystem("player")
+        self.idle_event.set()
+
+    def resume(self, index=0):
+        if self.paused:
+            self.mpv.resume()
+            self.playing = True
+            self.paused = False
+        elif not self.playing:
+            self.play(index=index)
+        self.tag_subsystem("player")
+        self.idle_event.set()
+
+    def move_single(self, old, new):
+        if (self.index - old) * (self.index - new) <= 0:
+            if self.index == old:
+                self.index = new
+            elif new > self.index or old < self.index:
+                self.index -= 1
+            else:
+                self.index += 1
+
+        k    = self.playlist.pop(old)
+        info = self.playlist_info.pop(old)
+        self.playlist.insert(new, k)
+        self.playlist_info.insert(new, info)
+
+        self.tag_subsystem("playlist")
+        self.idle_event.set()
+
+    def delete(self, index_start, index_end):
+        
+        del self.playlist[index_start:index_end]
+        del self.playlist_info[index_start:index_end]
+
+        if self.index >= index_start:
+            if self.index < index_end:
+                if self.playing:
+                    self.play(index_start)
+            else:
+                self.index -= (index_end - index_start)
+        
+        self.tag_subsystem("playlist")
+        self.idle_event.set()
+
+    def move(self, index_start, index_end, new_pos):
+        indices = list(range(index_start, index_end))
+        if new_pos > index_start:
+            indices.reverse()
+        for i in indices:
+            self.move_single(i, new_pos+i-index_start)
+
+    def change_volume(self, voldiff):
+        self.set_volume(self.volume + voldiff)
+
+    def set_volume(self, vol):
+        if vol > 100:
+            vol = 100
+        if vol < 0:
+            vol = 0
+        self.mpv.set_volume(vol)
+        self.volume = self.mpv.get_volume()
+        self.tag_subsystem("mixer")
+        self.idle_event.set()
+
+    def status(self):
+        playlistlength = len(self.playlist)
+        out = (
+            "repeat: 0\n"
+            "random: 0\n"
+            "single: 0\n"
+            "consume: 0\n"
+            "partition: default\n"
+            "playlist: 1\n"
+            f"playlistlength: {playlistlength}\n"
+            "mixrampdb: 0\n"
+            f"volume: {self.volume}\n"
+            f"state: {'play' if self.playing else 'pause' if self.paused else 'stop'}\n"
+            "lastloadedplaylist: \n"
+        )
+        if playlistlength > 0:
+            out += (
+                f"song: {self.index}\n"
+                f"songid: {self.index}\n"
+            )
+            k = self.playlist_info[self.index]
+            t = self.mpv.get_time()
+            if k in self.song_cache and "Time" in self.song_cache[k]:
+                d = self.song_cache[k]['Time']
+                out += f"duration: {d}\n"
+                if t:
+                    out += f"time: {int(t)}:{int(d)}\n"
+                    out += f"elapsed: {int(t)}\n"
+        return out
+
+    def currentsong(self):
+        if not self.playlist:
+            return
+
+        out = ""
+        k = self.playlist_info[self.index]
+        if k in self.song_cache:
+            out += ("".join([info + ": " + str(self.song_cache[k][info]) + "\n" for info in self.song_cache[k] ]))
+        else:
+            out += f"file: {k}\n"
+        out += f"Pos: {self.index}\n"
+        out += f"Id: {self.index}\n"
+
+        return out
+
+    def playlistinfo(self):
+        out = ""
+
+        for i, k in enumerate(self.playlist_info):
+            if k in self.song_cache:
+                out += ("".join([info + ": " + str(self.song_cache[k][info]) + "\n" for info in self.song_cache[k] ]))
+            else:
+                out += f"file: {k}\n"
+            out += f"Pos: {i}\n"
+            out += f"Id: {i}\n"
+
+        return out
+
+    def findartist(self,artist_name):
+        a = self.lsinfo(artist_name)
+        s = ""
+        for line in a.split("\n"):
+            try:
+                s += self.lsinfo(line.split(": ", 1)[1])
+            except:
+                continue
+        return s
+    
+    def clear(self):
+        self.playlist = []
+        self.playlist_info = []
+        self.index = 0
+        self.stop()
+        self.idle_event.set()
+        self.tag_subsystem("playlist")
+
+    def listartists(self):
+        s = self.lsinfo()
+        return s.replace("directory", "Artist")
+
+    def add_path(self, path):
+        s = self.lsinfo(path)
+        for line in s.split("\n"):
+            if line.startswith("directory: "):
+                self.add_path(line.split(": ", 1)[1])
+            if line.startswith("file: "):
+                self.addid(line.split(": ", 1)[1])
+
+    def addid(self, k):
+        url = self.nvd.stream_url(k)
+        self.playlist.append(url)
+        self.playlist_info.append(k)
+        self.idle_event.set()
+        self.tag_subsystem("playlist")
+   
+    def lsinfo(self,input_str=""):
+        if len(input_str) == 0:
+            out = ""
+            if not self.artist_cache:
+                artists = self.nvd.get_artists()
+                for a in artists:
+                    self.artist_cache[a["name"]] = a["id"]
+            for a in self.artist_cache:
+                out += f"directory: {a}\n"
+            return out
+
+        elif not "/" in input_str:
+            artist_name = input_str.split("/")[0]
+            if not artist_name in self.artist_cache:
+                self.purge_cache()
+                _ = self.lsinfo("")
+            artist_id = self.artist_cache.get(artist_name)
+            if not artist_id:
+                return 
+
+            albums = self.nvd.get_albums(artist_id)
+
+            out = ""
+            for a in albums:
+                self.album_cache[f"{artist_name}/{a['year']} - {a['name']}"] = a["id"]
+                out += f"directory: {artist_name}/{a['year']} - {a['name']}\n"
+        else:
+            if not input_str in self.album_cache:
+                _ = self.lsinfo(input_str.split("/")[0])
+            album_id = self.album_cache.get(input_str)
+            if not album_id:
+                return
+
+            album = self.nvd.get_album(album_id)
+
+            out = ""
+            for song in album.get("song", []):
+                k = song["id"]
+                if k not in self.song_cache:
+                    self.song_cache[k] = {
+                        "file":   song['id'],
+                        "Title":  song['title'],
+                        "Artist": song['artist'],
+                        "Album":  song['album'],
+                        "Track":  song['track'],
+                        "Date":   song['year'],
+                        "Time":   song['duration'],
+                    }
+
+                out += ("".join([info + ": " + str(self.song_cache[k][info]) + "\n" for info in self.song_cache[k] ]))
+
+        return out
+            
+    def outputs(self):
+        return (
+            "outputid: 0\n"
+            "outputname: mpv (virtual)\n"
+            "outputenabled: 1\n"
+        )
+
+    def decoders(self):
+        return (
+            "plugin: mad\n"
+            "suffix: mp3\n"
+            "suffix: mp2\n"
+            "plugin: flac\n"
+            "suffix: flac\n"
+        )
+
+
+class MPDConnection:
+    def __init__(self, mpd, conn):
+        self.mpd = mpd
+        self.conn = conn
+        self.idle = False
+        self.last_check = int(datetime.now().timestamp())
+        self.cmds = []
+        self.wait_for_list = False
+        self.ok_waitlist = False
+
+    def run(self):
+        with self.conn:
+            self.conn.sendall(b"OK MPD 0.24.0\n")
+            buffer = ""
+
+            try:
+                while True:
+                    data = self.conn.recv(1024)
+                    if not data:
+                        break
+
+                    buffer += data.decode()
+
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        cmd = line.strip()
+
+                        #print("Processing command:", repr(cmd))
+
+                        if cmd.startswith("command_list_"):
+                            if cmd.endswith("_begin"):
+                                self.cmds = []
+                                self.wait_for_list = True
+                                if "ok" in cmd:
+                                    self.ok_waitlist = True
+                                continue
+                            elif cmd.endswith("_end"):
+                                response = ""
+                                for cmd in self.cmds:
+                                    with self.mpd.lock:
+                                        cmdresp = self.handle(cmd)
+                                        cmdresp = cmdresp.replace("OK\n", ("list_OK\n" if self.ok_waitlist else ""))
+                                        response += cmdresp
+                                response += "OK\n"
+                                self.wait_for_list = False
+                                self.cmds = []
+                                self.ok_waitlist = False
+
+                        elif cmd.startswith("idle"):
+                            response, buffer = self.handle_idle(buffer)
+                        elif cmd == "noidle":
+                            continue
+                        elif self.wait_for_list:
+                            self.cmds.append(cmd)
+                            continue
+                        else:
+                            with self.mpd.lock:
+                                response = self.handle(cmd)
+                            
+                        if response:
+                            #print("  Response:", repr(response)[:50], "...", repr(response)[-50:])
+                            self.conn.sendall(response.encode("utf-8"))
+
+            except ConnectionResetError:
+                print("Client reset connection")
+            except BrokenPipeError:
+                print("Tried to write to closed socket")
+            except Exception as e:
+                print("Unexpected error", e)
+
+    def handle_idle(self, buffer):
+        self.idle = True
+
+        with self.mpd.lock:
+            current_check = int(datetime.now().timestamp()) - CHECK_DELAY
+            subs = set()
+            for t in self.mpd.subsystems_history:
+                if t > self.last_check:
+                    subs = subs.union(self.mpd.subsystems_history[t])
+            subs = list(subs)
+            self.last_check = current_check
+            if len(subs) > 0:
+                return "".join(f"changed: {s}\n" for s in subs) + "OK\n", buffer
+
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            cmd = line.strip()
+            if cmd == "noidle":
+                self.idle = False
+                return "OK\n", buffer
+            else:
+                return f"ACK unexpected command while idle: {cmd}\n", buffer
+    
+        while self.idle:
+            rlist, _, _ = select.select([self.conn], [], [], 0.5)
+    
+            if rlist:
+                data = self.conn.recv(1024)
+                if not data:
+                    return None, ""
+    
+                new_input = data.decode()
+                while "\n" in new_input:
+                    line, buffer = new_input.split("\n", 1)
+                    cmd = line.strip()
+    
+                    if cmd == "noidle":
+                        self.idle = False
+                        return "OK\n", buffer
+                    else:
+                        return f"ACK unexpected command while idle: {cmd}\n", buffer
+    
+            if self.mpd.idle_event.is_set():
+                self.mpd.idle_event.clear()
+                self.idle = False
+                return "changed: player\nOK\n", ""
+
+    def handle(self, cmd):
+        response = None
+
+        if cmd == "status":
+            response = self.mpd.status()
+
+        elif cmd == "currentsong":
+            response = self.mpd.currentsong()
+
+        elif cmd == "playlistinfo":
+            response = self.mpd.playlistinfo()
+
+        elif cmd == "outputs":
+            response = self.mpd.outputs()
+
+        elif cmd.startswith("plchanges"):
+            response = self.mpd.playlistinfo()
+
+        elif cmd == "list Artist":
+            response = self.mpd.listartists()
+
+        elif cmd == "lsinfo":
+            response = self.mpd.lsinfo()
+
+        elif cmd.startswith("play "):
+            response = self.mpd.resume(int(dequote(cmd.split(" ")[-1])))
+
+        elif cmd.startswith("playid "):
+            response = self.mpd.play(int(dequote(cmd.split(" ")[-1])))
+
+        elif cmd.startswith("addid "):
+            response = self.mpd.addid(dequote(cmd.split(" ")[-1]))
+
+        elif cmd.startswith("find Artist "):
+            response = self.mpd.findartist(cmd.split(" ")[-1])
+
+        elif cmd.startswith("add "):
+            response = self.mpd.add_path(dequote(cmd.split(" ", 1)[1]))
+
+        elif cmd.startswith("lsinfo "):
+            response = self.mpd.lsinfo(dequote(cmd.split(" ", 1)[1]))
+
+        elif cmd == "play":
+            response = self.mpd.resume()
+
+        elif cmd.startswith("pause"):
+            response = self.mpd.pause()
+
+        elif cmd == "decoders":
+            response = self.mpd.decoders()
+
+        elif cmd == "clear":
+            response = self.mpd.clear()
+        
+        elif cmd == "previous":
+            response = self.mpd.prev_track()
+
+        elif cmd.startswith("volume "):
+            response = self.mpd.change_volume(int(dequote(cmd.split(" ",1)[1])))
+
+        elif cmd.startswith("setvol "):
+            response = self.mpd.set_volume(int(dequote(cmd.split(" ",1)[1])))
+        
+        elif cmd.startswith("seek"):
+            s = cmd.split(" ", 1)[1]
+            if " " in s:
+                index, timepos = s.split(" ", 1)
+            else:
+                index = str(self.mpd.index)
+                timepos = s
+            index   = int(dequote(index))
+            timepos = int(float(dequote(timepos)))
+            response = self.mpd.seek(index, timepos)
+
+        elif cmd.startswith("update"):
+            response = self.mpd.purge_cache()
+
+        elif cmd == "stop":
+            response = self.mpd.stop()
+
+        elif cmd.startswith("delete "):
+            s = dequote(cmd.split(" ", 1)[1])
+            index_start = int(s.split(":")[0])
+            index_end   = int(s.split(":")[-1])
+            if index_end == index_start:
+                index_end += 1
+            response = self.mpd.delete(index_start,index_end)
+
+        elif cmd.startswith("move "):
+            s,n = cmd.split(" ", 1)[1].split(" ")
+            s = dequote(s)
+            index_start = int(s.split(":")[0])
+            index_end   = int(s.split(":")[-1])
+            if index_end == index_start:
+                index_end += 1
+            new_pos = int(dequote(n))
+            response = self.mpd.move(index_start,index_end,new_pos)
+
+        elif cmd == "next":
+            response = self.mpd.next_track()
+
+        else:
+            response = f"ACK [5@0] {{{cmd}}} unknown command\n"
+
+        if response:
+            return response + "OK\n"
+        else:
+            return "OK\n"
+
+def run(mpd):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((HOST, PORT))
+    s.listen(1)
+
+    print("MPD server running on", PORT)
+
+    pool = ThreadPoolExecutor(max_workers=10)
+
+    while True:
+        conn, _ = s.accept()
+        mpdc = MPDConnection(mpd, conn)
+        pool.submit(mpdc.run)
+
+
+class MPVController:
+    def __init__(self, socket_path="/tmp/mpdrome_mpv.sock"):
+        self.socket_path = socket_path
+        self.proc = None
+        self.sock = None
+        self.file = None
+        self.next_callback = None
+        self.listener_thread = None
+        self.lock = threading.Lock()
+
+        self.start_mpv()
+        self.connect()
+        self.start_listener()
+
+        self.pending = {}
+        self.req_id = 0
+        self.last_time = 0
+
+    def is_socket_alive(self):
+        try:
+            test_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            test_sock.connect(self.socket_path)
+            test_sock.close()
+            return True
+        except Exception:
+            return False
+
+    def start_mpv(self):
+        if os.path.exists(self.socket_path):
+            if self.is_socket_alive():
+                # Reuse existing mpv instance
+                return
+            else:
+                # Remove stale socket and proceed
+                os.remove(self.socket_path)
+
+        self.proc = subprocess.Popen([
+            "mpv",
+            "--idle=yes",
+            "--no-terminal",
+            "--no-video",
+            f"--input-ipc-server={self.socket_path}",
+        ])
+
+        for _ in range(50):
+            if os.path.exists(self.socket_path):
+                return 
+            time.sleep(0.1)
+        raise RuntimeError("could not create mpv socket")
+   
+    def ensure_mpv(self):
+        if self.proc is None or self.proc.poll() is not None:
+            self.start_mpv()
+            self.reset_connection()
+            self.connect()
+            self.start_listener() 
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(self.socket_path)
+        self.file = self.sock.makefile("r")
+
+    def reset_connection(self):
+        try:
+            if self.sock:
+                self.sock.close()
+        except:
+            pass
+    
+        self.connect()
+        self.start_listener()
+
+    def start_listener(self):
+        if self.listener_thread and self.listener_thread.is_alive():
+            return
+        def loop():
+            while True:
+                try:
+                    line = self.file.readline()
+                    if not line:
+                        break
+                    msg = json.loads(line)
+                    self.handle_event(msg)
+                except Exception as e:
+                    print("mpv listener error:", e)
+                    break
+        t = threading.Thread(target=loop, daemon=True)
+        t.start()
+        self.listener_thread = t
+
+    def handle_event(self, msg):
+        if "request_id" in msg:
+            rid = msg["request_id"]
+            if rid in self.pending:
+                self.pending[rid]["response"] = msg
+                self.pending[rid]["event"].set()
+            return 
+        if msg["event"] == "end-file":
+            self.on_track_end()
+
+    def on_track_end(self):
+        if self.next_callback:
+            self.next_callback()
+
+    def _send(self, command, wait=False):
+        self.ensure_mpv()
+
+        if wait:
+            self.req_id += 1
+            rid = self.req_id
+            command["request_id"] = rid
+            event = threading.Event()
+            self.pending[rid] = {"event": event, "response": None}
+        else:
+            rid = None
+
+        try:
+            with self.lock:
+                self.sock.sendall((json.dumps(command) + "\n").encode())
+
+        except Exception:
+            self.start_mpv()
+            self.connect()
+            with self.lock:
+                self.sock.sendall((json.dumps(command) + "\n").encode())
+
+        if wait:
+            event.wait(timeout=2)
+            resp = self.pending.pop(rid, {}).get("response")
+            return resp
+
+    def play_url(self,url):
+        return self._send({"command": ["loadfile", url, "replace"]})  
+
+    def pause(self):
+        return self._send({"command": ["set_property", "pause", True]})  
+
+    def set_volume(self, vol):
+        return self._send({"command": ["set_property", "volume", vol]})  
+
+    def get_volume(self):
+        resp = self._send({"command": ["get_property", "volume"]}, wait=True)  
+        if resp and resp.get("error") == "success":
+            return resp.get("data")
+        return
+
+    def get_time(self):
+        resp = self._send({"command": ["get_property", "time-pos"]}, wait=True)  
+        if resp and resp.get("error") == "success":
+            t = resp.get("data")
+            self.last_time = t
+            return resp.get("data")
+        return self.last_time
+
+    def resume(self):
+        return self._send({"command": ["set_property", "pause", False]})  
+
+    def stop(self):
+        return self._send({"command": ["stop"]})  
+
+    def seek(self, seconds):
+        return self._send({"command": ["seek", seconds, "absolute"]})
+
+    def close(self):
+        return self._send({"command": ["quit"]})
+
+class NavidromeClient:
+    def __init__(self, base_url, username, password):
+        self.base_url = base_url.rstrip("/")
+        self.username = username
+        self.password = password
+
+        self.salt  = self._gen_salt()
+        self.token = self._gen_token()
+    
+    def _gen_salt(self):
+        return "".join(random.choices(string.ascii_letters, k=8))
+
+    def _gen_token(self):
+        return hashlib.md5((self.password + self.salt).encode()).hexdigest()
+
+    def _get(self, method, params=None):
+        if params is None:
+            params = {}
+
+        params.update({
+            "u": self.username,
+            "t": self.token,
+            "s": self.salt,
+            "v": "1.16.1",
+            "c": "mpdrome",
+            "f": "json",
+        })
+        
+        url = f"{self.base_url}/rest/{method}"
+        r = requests.get(url, params=params)
+
+        return r.json()
+
+    def search(self, query):
+        return self._get("search3", {"query": query})
+
+    def stream_url(self, song_id):
+        return f"{self.base_url}/rest/stream.view?id={song_id}&u={self.username}&t={self.token}&s={self.salt}&v=1.16.1&c=mpdrome"
+
+    def get_artists(self):
+        data = self._get("getArtists")
+
+        artists = []
+
+        indexes = data["subsonic-response"]["artists"]["index"]
+
+        for group in indexes:
+            for artist in group.get("artist", []):
+                artists.append({
+                    "id": artist["id"],
+                    "name": artist["name"]
+                })
+
+        return artists
+
+    def get_artist(self, artist_id):
+        data = self._get("getArtist", {"id": artist_id})
+        return data["subsonic-response"]["artist"]
+    
+    def get_albums(self, artist_id):
+        artist = self.get_artist(artist_id)
+        return artist.get("album", [])
+    
+    def get_album(self, album_id):
+        data = self._get("getAlbum", {"id": album_id})
+        return data["subsonic-response"]["album"]
+    
+    def scrobble(self, song_id, submission=False, time_ms=None):
+        params = {
+            "id": song_id,
+            "submission": str(submission).lower(),
+        }
+
+        if time_ms is not None:
+            params["time"] = int(time_ms)
+
+        return self._get("scrobble.view", params)
+
+if __name__ == "__main__":
+    mpv = MPVController()
+    mpd = MPDServer(mpv)
+    run(mpd)
