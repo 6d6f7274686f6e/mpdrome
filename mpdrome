@@ -92,6 +92,8 @@ class MPDServer:
         url = self.playlist[self.index]
         if self.playing or self.paused:
             self.block_next = True
+
+        self.mpv.set_volume(self.volume)
         self.mpv.play_url(url)
         self.playing = True
         self.initiate_scrobble()
@@ -110,7 +112,8 @@ class MPDServer:
                 time_ms=int(self.track_started_at)
             )
         except Exception as e:
-            print("Now playing update failed:", e)
+            pass
+            #print("Now playing update failed:", e)
 
     def send_scrobble(self):
         if self.index >= len(self.playlist):
@@ -146,7 +149,8 @@ class MPDServer:
                 #print("Scrobbled:", self.playlist_info[self.index])
 
             except Exception as e:
-                print("Scrobble failed:", e)
+                return
+                #print("Scrobble failed:", e)
 
     def next_track(self):
         if self.block_next:
@@ -172,7 +176,7 @@ class MPDServer:
         self.paused = False
         self.index = 0
         self.mpv.stop()
-        self.block_next = False
+        self.mpv.close()
         self.tag_subsystem("player")
         self.idle_event.set()
 
@@ -274,13 +278,14 @@ class MPDServer:
                 f"songid: {self.index}\n"
             )
             k = self.playlist_info[self.index]
-            t = self.mpv.get_time()
-            if k in self.song_cache and "Time" in self.song_cache[k]:
-                d = self.song_cache[k]['Time']
-                out += f"duration: {d}\n"
-                if t:
-                    out += f"time: {int(t)}:{int(d)}\n"
-                    out += f"elapsed: {int(t)}\n"
+            if self.playing or self.paused:
+              t = self.mpv.get_time()
+              if k in self.song_cache and "Time" in self.song_cache[k]:
+                  d = self.song_cache[k]['Time']
+                  out += f"duration: {d}\n"
+                  if t:
+                      out += f"time: {int(t)}:{int(d)}\n"
+                      out += f"elapsed: {int(t)}\n"
         return out
 
     def currentsong(self):
@@ -322,10 +327,10 @@ class MPDServer:
         return s
     
     def clear(self):
+        self.stop()
         self.playlist = []
         self.playlist_info = []
         self.index = 0
-        self.stop()
         self.idle_event.set()
         self.tag_subsystem("playlist")
 
@@ -482,11 +487,14 @@ class MPDConnection:
                             self.conn.sendall(response.encode("utf-8"))
 
             except ConnectionResetError:
-                print("Client reset connection")
+                return
+                #print("Client reset connection")
             except BrokenPipeError:
-                print("Tried to write to closed socket")
+                return
+                #print("Tried to write to closed socket")
             except Exception as e:
-                print("Unexpected error", e)
+                return
+                #print("Unexpected error", e)
 
     def handle_idle(self, buffer):
         self.idle = True
@@ -744,7 +752,7 @@ class MPVController:
                     msg = json.loads(line)
                     self.handle_event(msg)
                 except Exception as e:
-                    print("mpv listener error:", e)
+                    #print("mpv listener error:", e)
                     break
         t = threading.Thread(target=loop, daemon=True)
         t.start()
@@ -824,7 +832,40 @@ class MPVController:
         return self._send({"command": ["seek", seconds, "absolute"]})
 
     def close(self):
-        return self._send({"command": ["quit"]})
+        try:
+            self._send({"command": ["quit"]})
+        except Exception:
+            pass
+
+        if self.proc:
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+
+        try:
+            if self.file:
+                self.file.close()
+        except:
+            pass
+
+        try:
+            if self.sock:
+                self.sock.close()
+        except:
+            pass
+
+        try:
+            if os.path.exists(self.socket_path):
+                os.remove(self.socket_path)
+        except:
+            pass
+
+        self.proc = None
+        self.sock = None
+        self.file = None
+        self.listener_thread = None
 
 class NavidromeClient:
     def __init__(self, base_url, username, password):
